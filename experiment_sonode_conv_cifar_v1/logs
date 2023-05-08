@@ -1,0 +1,273 @@
+/home/yjyjyyj/Desktop/node/sonode/experiments/mnist/mnist_sonode_conv_v.py
+import os
+import argparse
+import logging
+import time
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+import torchvision.datasets as datasets
+import torchvision.transforms as transforms
+from models import ODEBlock, norm, initial_velocity, ResBlock, ODEfunc, conv1x1, Flatten
+from dataloaders import get_cifar_loaders, get_mnist_loaders
+from utils import get_logger, makedirs, count_parameters, inf_generator, learning_rate_with_decay, RunningAverageMeter, accuracy
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--network', type=str, choices=['resnet', 'odenet'], default='odenet')
+parser.add_argument('--tol', type=float, default=1e-3)
+parser.add_argument('--adjoint', type=eval, default=False, choices=[True, False])
+parser.add_argument('--downsampling-method', type=str, default='conv', choices=['conv', 'res'])
+parser.add_argument('--nepochs', type=int, default=20)
+parser.add_argument('--data_aug', type=eval, default=True, choices=[True, False])
+parser.add_argument('--lr', type=float, default=0.1)
+parser.add_argument('--batch_size', type=int, default=128)
+parser.add_argument('--test_batch_size', type=int, default=1000)
+parser.add_argument('--dataset', type=str, choices=['mnist', 'cifar'], default='cifar')
+parser.add_argument('--save', type=str, default='./experiment_sonode_conv_v1')
+parser.add_argument('--gpu', type=int, default=0)
+parser.add_argument('--debug', action='store_true')
+args = parser.parse_args()
+
+if args.adjoint:
+    from torchdiffeq import odeint_adjoint as odeint
+else:
+    from torchdiffeq import odeint
+
+
+if __name__ == '__main__':
+
+    makedirs(args.save)
+    logger = get_logger(logpath=os.path.join(args.save, 'logs'), filepath=os.path.abspath(__file__))
+    logger.info(args)
+
+    device = torch.device('cuda:' + str(args.gpu) if torch.cuda.is_available() else 'cpu')
+
+    is_odenet = args.network == 'odenet'
+    in_channel = 3
+    if args.dataset == 'mnist':
+        in_channel = 1
+    if args.downsampling_method == 'conv':
+        downsampling_layers = [
+            nn.Conv2d(in_channel, 64, 3, 1),
+            norm(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, 4, 2, 1),
+            norm(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, 4, 2, 1),
+        ]
+    elif args.downsampling_method == 'res':
+        downsampling_layers = [
+            nn.Conv2d(in_channel, 64, 3, 1),
+            ResBlock(64, 64, stride=2, downsample=conv1x1(64, 64, 2)),
+            ResBlock(64, 64, stride=2, downsample=conv1x1(64, 64, 2)),
+        ]
+
+    feature_layers = [initial_velocity(64), ODEBlock(ODEfunc(64), args.tol, args.adjoint)] if is_odenet else [ResBlock(64, 64) for _ in range(6)]
+    fc_layers = [norm(64), nn.ReLU(inplace=True), nn.AdaptiveAvgPool2d((1, 1)), Flatten(), nn.Linear(64, 10)]
+
+    model = nn.Sequential(*downsampling_layers, *feature_layers, *fc_layers).to(device)
+
+    logger.info(model)
+    logger.info('Number of parameters: {}'.format(count_parameters(model)))
+
+    criterion = nn.CrossEntropyLoss().to(device)
+
+    if args.dataset == 'mnist':
+        train_loader, test_loader, train_eval_loader = get_mnist_loaders(
+            args.data_aug, args.batch_size, args.test_batch_size
+        )
+    elif args.dataset == 'cifar':
+        train_loader, test_loader, train_eval_loader = get_cifar_loaders(
+            args.data_aug, args.batch_size, args.test_batch_size
+        )
+
+    data_gen = inf_generator(train_loader)
+    batches_per_epoch = len(train_loader)
+
+    lr_fn = learning_rate_with_decay(
+        args.batch_size, batch_denom=128, batches_per_epoch=batches_per_epoch, boundary_epochs=[60, 100, 140],
+        decay_rates=[1, 0.1, 0.01, 0.001], lr=args.lr
+    )
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
+
+    best_acc = 0
+    batch_time_meter = RunningAverageMeter()
+    f_nfe_meter = RunningAverageMeter()
+    b_nfe_meter = RunningAverageMeter()
+    end = time.time()
+    
+    epoch_arr = []
+    time_val_arr = []
+    time_avg_arr = []
+    nfe_f_arr = []
+    nfe_b_arr = []
+    train_acc_arr = []
+    test_acc_arr = []
+    
+    
+    for itr in range(args.nepochs * batches_per_epoch):
+
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr_fn(itr)
+
+        optimizer.zero_grad()
+        x, y = data_gen.__next__()
+        x = x.to(device)
+        y = y.to(device)
+        # print(x.size())
+        logits = model(x)
+        loss = criterion(logits, y)
+
+        if is_odenet:
+            nfe_forward = feature_layers[1].nfe
+            feature_layers[1].nfe = 0
+
+        loss.backward()
+        optimizer.step()
+
+        if is_odenet:
+            nfe_backward = feature_layers[1].nfe
+            feature_layers[1].nfe = 0
+
+        batch_time_meter.update(time.time() - end)
+        if is_odenet:
+            f_nfe_meter.update(nfe_forward)
+            b_nfe_meter.update(nfe_backward)
+        end = time.time()
+
+        if itr % batches_per_epoch == 0:
+            with torch.no_grad():
+                train_acc = accuracy(model, train_eval_loader, device)
+                val_acc = accuracy(model, test_loader, device)
+                if val_acc > best_acc:
+                    torch.save({'state_dict': model.state_dict(), 'args': args}, os.path.join(args.save, 'model.pth'))
+                    best_acc = val_acc
+                logger.info(
+                    "Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
+                    "Train Acc {:.4f} | Test Acc {:.4f}".format(
+                        itr // batches_per_epoch, batch_time_meter.val, batch_time_meter.avg, f_nfe_meter.avg,
+                        b_nfe_meter.avg, train_acc, val_acc
+                    )
+                )
+                epoch_arr += [itr // batches_per_epoch]
+                time_val_arr += [batch_time_meter.val]
+                time_avg_arr += [batch_time_meter.avg]
+                nfe_f_arr += [f_nfe_meter.avg]
+                nfe_b_arr += [b_nfe_meter.avg]
+                train_acc_arr += [train_acc]
+                test_acc_arr += [val_acc]
+    
+    epoch_arr = np.asarray(epoch_arr)
+    time_val_arr = np.asarray(time_val_arr)
+    time_avg_arr = np.asarray(time_avg_arr)
+    nfe_f_arr = np.asarray(nfe_f_arr)
+    nfe_b_arr = np.asarray(nfe_b_arr)
+    train_acc_arr = np.asarray(train_acc_arr)
+    test_acc_arr = np.asarray(test_acc_arr)
+    
+    np.save(os.path.join(args.save, 'epoch_arr.npy'), epoch_arr)
+    np.save(os.path.join(args.save, 'time_val_arr.npy'), time_val_arr)
+    np.save(os.path.join(args.save, 'time_avg_arr.npy'), time_avg_arr)
+    np.save(os.path.join(args.save, 'nfe_f_arr.npy'), nfe_f_arr)
+    np.save(os.path.join(args.save, 'nfe_b_arr.npy'), nfe_b_arr)
+    np.save(os.path.join(args.save, 'train_acc_arr.npy'), train_acc_arr)
+    np.save(os.path.join(args.save, 'test_acc_arr.npy'), test_acc_arr)
+    
+    
+    
+    
+Namespace(adjoint=False, batch_size=128, data_aug=True, dataset='cifar', debug=False, downsampling_method='conv', gpu=0, lr=0.1, nepochs=50, network='odenet', save='./experiment_sonode_conv_cifar_v1', test_batch_size=1000, tol=0.001)
+Sequential(
+  (0): Conv2d(3, 64, kernel_size=(3, 3), stride=(1, 1))
+  (1): GroupNorm(32, 64, eps=1e-05, affine=True)
+  (2): ReLU(inplace=True)
+  (3): Conv2d(64, 64, kernel_size=(4, 4), stride=(2, 2), padding=(1, 1))
+  (4): GroupNorm(32, 64, eps=1e-05, affine=True)
+  (5): ReLU(inplace=True)
+  (6): Conv2d(64, 64, kernel_size=(4, 4), stride=(2, 2), padding=(1, 1))
+  (7): initial_velocity(
+    (norm1): GroupNorm(32, 64, eps=1e-05, affine=True)
+    (relu): ReLU(inplace=True)
+    (conv1): ConcatConv2d(
+      (_layer): Conv2d(65, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+    )
+    (norm2): GroupNorm(32, 64, eps=1e-05, affine=True)
+    (conv2): ConcatConv2d(
+      (_layer): Conv2d(65, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+    )
+    (norm3): GroupNorm(32, 64, eps=1e-05, affine=True)
+  )
+  (8): ODEBlock(
+    (odefunc): ODEfunc(
+      (norm1): GroupNorm(32, 64, eps=1e-05, affine=True)
+      (relu): ReLU(inplace=True)
+      (conv1): ConcatConv2d(
+        (_layer): Conv2d(65, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+      )
+      (norm2): GroupNorm(32, 64, eps=1e-05, affine=True)
+      (conv2): ConcatConv2d(
+        (_layer): Conv2d(65, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+      )
+      (norm3): GroupNorm(32, 64, eps=1e-05, affine=True)
+    )
+  )
+  (9): GroupNorm(32, 64, eps=1e-05, affine=True)
+  (10): ReLU(inplace=True)
+  (11): AdaptiveAvgPool2d(output_size=(1, 1))
+  (12): Flatten()
+  (13): Linear(in_features=64, out_features=10, bias=True)
+)
+Number of parameters: 284810
+Epoch 0000 | Time 1.026 (1.026) | NFE-F 20.0 | NFE-B 0.0 | Train Acc 0.0956 | Test Acc 0.0940
+Epoch 0001 | Time 0.168 (0.128) | NFE-F 20.2 | NFE-B 0.0 | Train Acc 0.4129 | Test Acc 0.4167
+Epoch 0002 | Time 0.189 (0.111) | NFE-F 20.2 | NFE-B 0.0 | Train Acc 0.5497 | Test Acc 0.5406
+Epoch 0003 | Time 0.195 (0.111) | NFE-F 20.2 | NFE-B 0.0 | Train Acc 0.6221 | Test Acc 0.6122
+Epoch 0004 | Time 0.190 (0.110) | NFE-F 20.2 | NFE-B 0.0 | Train Acc 0.6693 | Test Acc 0.6578
+Epoch 0005 | Time 0.171 (0.110) | NFE-F 20.2 | NFE-B 0.0 | Train Acc 0.7123 | Test Acc 0.6915
+Epoch 0006 | Time 0.188 (0.110) | NFE-F 20.2 | NFE-B 0.0 | Train Acc 0.7335 | Test Acc 0.7094
+Epoch 0007 | Time 0.199 (0.110) | NFE-F 20.2 | NFE-B 0.0 | Train Acc 0.7651 | Test Acc 0.7330
+Epoch 0008 | Time 0.197 (0.110) | NFE-F 20.2 | NFE-B 0.0 | Train Acc 0.7827 | Test Acc 0.7478
+Epoch 0009 | Time 0.176 (0.110) | NFE-F 20.2 | NFE-B 0.0 | Train Acc 0.7774 | Test Acc 0.7453
+Epoch 0010 | Time 0.186 (0.110) | NFE-F 20.2 | NFE-B 0.0 | Train Acc 0.7858 | Test Acc 0.7485
+Epoch 0011 | Time 0.196 (0.110) | NFE-F 20.2 | NFE-B 0.0 | Train Acc 0.8068 | Test Acc 0.7602
+Epoch 0012 | Time 0.187 (0.111) | NFE-F 20.2 | NFE-B 0.0 | Train Acc 0.8378 | Test Acc 0.7929
+Epoch 0013 | Time 0.187 (0.112) | NFE-F 20.2 | NFE-B 0.0 | Train Acc 0.8281 | Test Acc 0.7798
+Epoch 0014 | Time 0.195 (0.113) | NFE-F 20.2 | NFE-B 0.0 | Train Acc 0.8523 | Test Acc 0.7996
+Epoch 0015 | Time 0.184 (0.113) | NFE-F 20.2 | NFE-B 0.0 | Train Acc 0.8453 | Test Acc 0.7918
+Epoch 0016 | Time 0.187 (0.113) | NFE-F 20.2 | NFE-B 0.0 | Train Acc 0.8596 | Test Acc 0.7995
+Epoch 0017 | Time 0.191 (0.113) | NFE-F 20.2 | NFE-B 0.0 | Train Acc 0.8708 | Test Acc 0.8051
+Epoch 0018 | Time 0.192 (0.113) | NFE-F 20.2 | NFE-B 0.0 | Train Acc 0.8503 | Test Acc 0.7896
+Epoch 0019 | Time 0.201 (0.113) | NFE-F 20.3 | NFE-B 0.0 | Train Acc 0.8815 | Test Acc 0.8104
+Epoch 0020 | Time 0.200 (0.120) | NFE-F 21.7 | NFE-B 0.0 | Train Acc 0.8776 | Test Acc 0.8091
+Epoch 0021 | Time 0.233 (0.141) | NFE-F 26.1 | NFE-B 0.0 | Train Acc 0.8786 | Test Acc 0.8055
+Epoch 0022 | Time 0.233 (0.141) | NFE-F 26.3 | NFE-B 0.0 | Train Acc 0.8797 | Test Acc 0.8076
+Epoch 0023 | Time 0.245 (0.142) | NFE-F 26.3 | NFE-B 0.0 | Train Acc 0.8920 | Test Acc 0.8143
+Epoch 0024 | Time 0.230 (0.141) | NFE-F 26.3 | NFE-B 0.0 | Train Acc 0.8902 | Test Acc 0.8117
+Epoch 0025 | Time 0.235 (0.142) | NFE-F 26.3 | NFE-B 0.0 | Train Acc 0.8813 | Test Acc 0.8049
+Epoch 0026 | Time 0.241 (0.142) | NFE-F 26.3 | NFE-B 0.0 | Train Acc 0.8995 | Test Acc 0.8188
+Epoch 0027 | Time 0.222 (0.142) | NFE-F 26.3 | NFE-B 0.0 | Train Acc 0.8959 | Test Acc 0.8083
+Epoch 0028 | Time 0.229 (0.142) | NFE-F 26.3 | NFE-B 0.0 | Train Acc 0.8880 | Test Acc 0.8004
+Epoch 0029 | Time 0.239 (0.142) | NFE-F 26.3 | NFE-B 0.0 | Train Acc 0.9187 | Test Acc 0.8260
+Epoch 0030 | Time 0.234 (0.142) | NFE-F 26.3 | NFE-B 0.0 | Train Acc 0.9084 | Test Acc 0.8178
+Epoch 0031 | Time 0.243 (0.142) | NFE-F 26.3 | NFE-B 0.0 | Train Acc 0.9131 | Test Acc 0.8226
+Epoch 0032 | Time 0.243 (0.142) | NFE-F 26.3 | NFE-B 0.0 | Train Acc 0.9136 | Test Acc 0.8220
+Epoch 0033 | Time 0.245 (0.142) | NFE-F 26.3 | NFE-B 0.0 | Train Acc 0.9181 | Test Acc 0.8161
+Epoch 0034 | Time 0.244 (0.142) | NFE-F 26.3 | NFE-B 0.0 | Train Acc 0.9193 | Test Acc 0.8237
+Epoch 0035 | Time 0.244 (0.141) | NFE-F 26.3 | NFE-B 0.0 | Train Acc 0.9270 | Test Acc 0.8229
+Epoch 0036 | Time 0.235 (0.141) | NFE-F 26.3 | NFE-B 0.0 | Train Acc 0.9329 | Test Acc 0.8238
+Epoch 0037 | Time 0.250 (0.141) | NFE-F 26.3 | NFE-B 0.0 | Train Acc 0.9324 | Test Acc 0.8292
+Epoch 0038 | Time 0.254 (0.142) | NFE-F 26.3 | NFE-B 0.0 | Train Acc 0.9310 | Test Acc 0.8231
+Epoch 0039 | Time 0.269 (0.142) | NFE-F 26.3 | NFE-B 0.0 | Train Acc 0.9156 | Test Acc 0.8146
+Epoch 0040 | Time 0.253 (0.142) | NFE-F 26.3 | NFE-B 0.0 | Train Acc 0.9394 | Test Acc 0.8336
+Epoch 0041 | Time 0.245 (0.142) | NFE-F 26.3 | NFE-B 0.0 | Train Acc 0.9329 | Test Acc 0.8229
+Epoch 0042 | Time 0.241 (0.142) | NFE-F 26.3 | NFE-B 0.0 | Train Acc 0.9452 | Test Acc 0.8312
+Epoch 0043 | Time 0.247 (0.142) | NFE-F 26.3 | NFE-B 0.0 | Train Acc 0.9071 | Test Acc 0.7978
+Epoch 0044 | Time 0.241 (0.141) | NFE-F 26.3 | NFE-B 0.0 | Train Acc 0.9336 | Test Acc 0.8230
+Epoch 0045 | Time 0.243 (0.142) | NFE-F 26.3 | NFE-B 0.0 | Train Acc 0.9463 | Test Acc 0.8254
+Epoch 0046 | Time 0.225 (0.141) | NFE-F 26.3 | NFE-B 0.0 | Train Acc 0.9510 | Test Acc 0.8303
+Epoch 0047 | Time 0.240 (0.141) | NFE-F 26.3 | NFE-B 0.0 | Train Acc 0.9426 | Test Acc 0.8241
+Epoch 0048 | Time 0.238 (0.141) | NFE-F 26.3 | NFE-B 0.0 | Train Acc 0.9527 | Test Acc 0.8331
+Epoch 0049 | Time 0.240 (0.141) | NFE-F 26.3 | NFE-B 0.0 | Train Acc 0.9282 | Test Acc 0.8091
