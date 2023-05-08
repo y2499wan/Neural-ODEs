@@ -1,6 +1,6 @@
 # Neural-ODEs
 
-Run experiments to compare [Neural ODE](https://arxiv.org/pdf/1806.07366.pdf), [Augmented Neural ODE](https://arxiv.org/abs/1904.01681), and [Second-order Neural ODE](https://arxiv.org/abs/2109.14158) on MNIST, CIFAR10, TinyImageNet(TBD)
+Run experiments to compare accuracy and NFE (# of function evaluations) for [Neural ODE](https://arxiv.org/pdf/1806.07366.pdf), [Augmented Neural ODE](https://arxiv.org/abs/1904.01681), and [Second-order Neural ODE](https://arxiv.org/abs/2109.14158) on MNIST, CIFAR10, TinyImageNet(TBD)
 
 ## Prep
 
