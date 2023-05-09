@@ -28,6 +28,7 @@ MANIFEST
 *v1/
 *v2/
 *v3/
+.data/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
