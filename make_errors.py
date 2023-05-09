@@ -1,8 +1,14 @@
 import numpy as np
+import argparse
 
+parser = argparse.ArgumentParser()
+parser.add_argument('--dataset', type=str, choices=['mnist', 'cifar'], default='cifar')
+# number of times each trail run
+parser.add_argument('--nexps', type=int, default=3)
+args = parser.parse_args()
 
-models = ['node_cifar_v', 'sonode_conv_cifar_v', 'anode_cifar_v']
-experiment_numbers = ['1', '2']
+models = ['node_'+args.dataset+'_v', 'sonode_conv_'+args.dataset+'_v', 'anode_'+args.dataset+'_v']
+experiment_numbers = [str(i) for i in range(1,args.nexps+1)]
 array_types = ['train_acc', 'test_acc']
 
 
@@ -31,8 +37,7 @@ def make_moving_av(model_no, experiment_no, array_type_no):
     np.save(filename+'running_epoch_arr.npy', samp_eps_array)
 
 
-for i in range(3):
-    for j in range(2):
-        for k in range(2):
+for i in range(len(models)):
+    for j in range(len(experiment_numbers)):
+        for k in range(len(array_types)):
             make_moving_av(i, j, k)
-
