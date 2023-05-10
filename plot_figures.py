@@ -72,7 +72,7 @@ rc('text', usetex=True)
 plt.legend(loc='lower right', fontsize=12)
 plt.xlabel('Epoch', fontsize=16)
 plt.ylabel('Running Training Accuracy', fontsize=16)
-plt.ylim(0.05, 0.99)
+plt.ylim(0.989, 1.001)
 plt.title(f'{args.dataset.upper()} Training Accuracy', fontsize=22)
 
 
@@ -88,7 +88,7 @@ rc('text', usetex=True)
 #plt.legend(loc='lower right', fontsize=12)
 plt.xlabel('Epoch', fontsize=16)
 plt.ylabel('Running Test Accuracy', fontsize=16)
-plt.ylim(0.05, 0.99)
+plt.ylim(0.989, 1.001)
 plt.title(f'{args.dataset.upper()} Test Accuracy', fontsize=22)
 
 
