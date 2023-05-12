@@ -20,4 +20,4 @@ You will also need to install `PyTorch 1.4.0` from the [official website](https:
 
 ## Run the experiments
 
-`python mnist_sonode_conv_v.py --save './experiment_sonode_conv_cifar' --nepochs 5 --dataset cifar/mnist` 
+`python sonode_conv_v.py --save './experiment_sonode_conv_cifar' --nepochs 5 --dataset cifar/mnist` 
