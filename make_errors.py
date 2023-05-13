@@ -7,7 +7,8 @@ parser.add_argument('--dataset', type=str, choices=['mnist', 'cifar'], default='
 parser.add_argument('--nexps', type=int, default=3)
 args = parser.parse_args()
 
-models = ['node_'+args.dataset+'_v', 'sonode_conv_'+args.dataset+'_v', 'anode_'+args.dataset+'_v']
+models = ['node_'+args.dataset+'_v', 'sonode_conv_'+args.dataset+'_v', 'anode_'+args.dataset+'_v',\
+          'anode10_'+args.dataset+'_v']
 experiment_numbers = [str(i) for i in range(1,args.nexps+1)]
 array_types = ['train_acc', 'test_acc']
 
